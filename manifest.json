@@ -1,0 +1,48 @@
+{
+	"Name": "Linux Media",
+	"Description": "Linux media controls using MPRIS",
+	"Author": "Aman Khanna (nekename)",
+	"Version": "1.0.0",
+	"CodePathLin": "oampris",
+	"Icon": "icons/playpause",
+	"Category": "Media",
+	"OS": [{ "Platform": "linux" }],
+	"Actions": [
+		{
+			"UUID": "me.amankhanna.oampris.playpause",
+			"Name": "Play/Pause",
+			"Icon": "icons/playpause",
+			"States": [{ "Image": "actionDefaultImage" }],
+			"Controllers": [ "Keypad" ],
+			"SupportedInMultiActions": true,
+			"Tooltip": "Toggle the playback state"
+		},
+		{
+			"UUID": "me.amankhanna.oampris.stop",
+			"Name": "Stop",
+			"Icon": "icons/stop",
+			"States": [{ "Image": "actionDefaultImage" }],
+			"Controllers": [ "Keypad" ],
+			"SupportedInMultiActions": true,
+			"Tooltip": "Stop playback"
+		},
+		{
+			"UUID": "me.amankhanna.oampris.previous",
+			"Name": "Previous",
+			"Icon": "icons/previous",
+			"States": [{ "Image": "actionDefaultImage" }],
+			"Controllers": [ "Keypad" ],
+			"SupportedInMultiActions": true,
+			"Tooltip": "Go to the previous track"
+		},
+		{
+			"UUID": "me.amankhanna.oampris.next",
+			"Name": "Next",
+			"Icon": "icons/next",
+			"States": [{ "Image": "actionDefaultImage" }],
+			"Controllers": [ "Keypad" ],
+			"SupportedInMultiActions": true,
+			"Tooltip": "Go to the next track"
+		}
+	]
+}
