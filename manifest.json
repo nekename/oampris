@@ -13,7 +13,7 @@
 			"Name": "Play/Pause",
 			"Icon": "icons/playpause",
 			"States": [{ "Image": "actionDefaultImage" }],
-			"Controllers": [ "Keypad" ],
+			"Controllers": ["Keypad"],
 			"SupportedInMultiActions": true,
 			"Tooltip": "Toggle the playback state"
 		},
@@ -22,7 +22,7 @@
 			"Name": "Stop",
 			"Icon": "icons/stop",
 			"States": [{ "Image": "actionDefaultImage" }],
-			"Controllers": [ "Keypad" ],
+			"Controllers": ["Keypad"],
 			"SupportedInMultiActions": true,
 			"Tooltip": "Stop playback"
 		},
@@ -31,7 +31,7 @@
 			"Name": "Previous",
 			"Icon": "icons/previous",
 			"States": [{ "Image": "actionDefaultImage" }],
-			"Controllers": [ "Keypad" ],
+			"Controllers": ["Keypad"],
 			"SupportedInMultiActions": true,
 			"Tooltip": "Go to the previous track"
 		},
@@ -40,9 +40,29 @@
 			"Name": "Next",
 			"Icon": "icons/next",
 			"States": [{ "Image": "actionDefaultImage" }],
-			"Controllers": [ "Keypad" ],
+			"Controllers": ["Keypad"],
 			"SupportedInMultiActions": true,
 			"Tooltip": "Go to the next track"
+		},
+		{
+			"UUID": "me.amankhanna.oampris.repeat",
+			"Name": "Repeat",
+			"Icon": "icons/repeat_playlist",
+			"States": [{ "Image": "icons/repeat_none" }, { "Image": "icons/repeat_playlist" }, { "Image": "icons/repeat_track" }],
+			"DisableAutomaticStates": true,
+			"Controllers": ["Keypad"],
+			"SupportedInMultiActions": true,
+			"Tooltip": "Cycle the repeat mode"
+		},
+		{
+			"UUID": "me.amankhanna.oampris.shuffle",
+			"Name": "Shuffle",
+			"Icon": "icons/shuffle_on",
+			"States": [{ "Image": "icons/shuffle_off" }, { "Image": "icons/shuffle_on" }],
+			"DisableAutomaticStates": true,
+			"Controllers": ["Keypad"],
+			"SupportedInMultiActions": true,
+			"Tooltip": "Toggle shuffle"
 		}
 	]
 }

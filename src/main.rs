@@ -3,12 +3,13 @@ use futures_util::StreamExt;
 use openaction::*;
 use reqwest::Client;
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use tokio::sync::Mutex;
 use zbus::fdo::DBusProxy;
 use zbus::{Connection, MatchRule, MessageStream, MessageType, Proxy};
 use zvariant::Value;
 
-async fn find_active_player(conn: &Connection) -> Result<String, Box<dyn std::error::Error>> {
+async fn find_active_player(conn: &Connection) -> Result<String, Box<dyn StdError>> {
 	let proxy = Proxy::new(
 		conn,
 		"org.freedesktop.DBus",
@@ -24,19 +25,44 @@ async fn find_active_player(conn: &Connection) -> Result<String, Box<dyn std::er
 		.ok_or_else(|| "No MPRIS players found".into())
 }
 
-async fn call_mpris_method(method: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn get_mpris_proxy() -> Result<Proxy<'static>, Box<dyn StdError>> {
 	let conn = Connection::session().await?;
 	let player_name = find_active_player(&conn).await?;
 
 	let proxy = Proxy::new(
 		&conn,
-		player_name.as_str(),
+		player_name,
 		"/org/mpris/MediaPlayer2",
 		"org.mpris.MediaPlayer2.Player",
 	)
 	.await?;
 
+	Ok(proxy)
+}
+
+async fn call_mpris_method(method: &str) -> Result<(), Box<dyn StdError>> {
+	let proxy = get_mpris_proxy().await?;
 	proxy.call_method(method, &()).await?;
+	Ok(())
+}
+
+async fn cycle_repeat_mode() -> Result<(), Box<dyn StdError>> {
+	let proxy = get_mpris_proxy().await?;
+	let current: String = proxy.get_property("LoopStatus").await?;
+	let next = match current.as_str() {
+		"None" => "Playlist",
+		"Playlist" => "Track",
+		"Track" => "None",
+		_ => "None",
+	};
+	proxy.set_property("LoopStatus", next).await?;
+	Ok(())
+}
+
+async fn toggle_shuffle() -> Result<(), Box<dyn StdError>> {
+	let proxy = get_mpris_proxy().await?;
+	let shuffle: bool = proxy.get_property("Shuffle").await?;
+	proxy.set_property("Shuffle", &(!shuffle)).await?;
 	Ok(())
 }
 
@@ -70,30 +96,23 @@ impl openaction::ActionEventHandler for ActionEventHandler {
 		event: KeyEvent,
 		_outbound: &mut OutboundEventManager,
 	) -> EventHandlerResult {
-		let method = match event.action.as_str() {
-			"me.amankhanna.oampris.playpause" => "PlayPause",
-			"me.amankhanna.oampris.stop" => "Stop",
-			"me.amankhanna.oampris.previous" => "Previous",
-			"me.amankhanna.oampris.next" => "Next",
+		if let Err(e) = match event.action.as_str() {
+			"me.amankhanna.oampris.playpause" => call_mpris_method("PlayPause").await,
+			"me.amankhanna.oampris.stop" => call_mpris_method("Stop").await,
+			"me.amankhanna.oampris.previous" => call_mpris_method("Previous").await,
+			"me.amankhanna.oampris.next" => call_mpris_method("Next").await,
+			"me.amankhanna.oampris.repeat" => cycle_repeat_mode().await,
+			"me.amankhanna.oampris.shuffle" => toggle_shuffle().await,
 			_ => return Ok(()),
-		};
-
-		if let Err(e) = call_mpris_method(method).await {
-			log::error!("MPRIS call failed ({}): {}", method, e);
+		} {
+			log::error!("MPRIS call failed ({}): {}", event.action, e);
 		}
 
 		Ok(())
 	}
 }
 
-fn extract_art_url_from_value(value: &Value) -> Option<String> {
-	value
-		.downcast_ref::<zvariant::Dict>()
-		.and_then(|dict| dict.get::<str, str>("mpris:artUrl").ok().flatten())
-		.map(|url| url.to_string())
-}
-
-async fn fetch_and_convert_to_data_url(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+async fn fetch_and_convert_to_data_url(url: &str) -> Result<String, Box<dyn StdError>> {
 	let client = Client::new();
 	let response = client.get(url).send().await?;
 	let bytes = response.bytes().await?;
@@ -186,7 +205,11 @@ async fn watch_album_art() {
 			}
 
 			if let Some(metadata_value) = changed_properties.get("Metadata") {
-				if let Some(art_url) = extract_art_url_from_value(metadata_value) {
+				if let Some(art_url) = metadata_value
+					.downcast_ref::<zvariant::Dict>()
+					.and_then(|dict| dict.get::<str, str>("mpris:artUrl").ok().flatten())
+					.map(|url| url.to_string())
+				{
 					if Some(&art_url) != last_url.as_ref() {
 						last_url = Some(art_url.clone());
 
@@ -216,6 +239,44 @@ async fn watch_album_art() {
 									log::error!("Failed to set image: {}", e);
 								}
 							}
+						}
+					}
+				}
+			}
+
+			if let Some(loop_status_value) = changed_properties.get("LoopStatus") {
+				let loop_status = loop_status_value.downcast_ref::<str>().unwrap_or("None");
+				let state = match loop_status {
+					"None" => 0,
+					"Playlist" => 1,
+					"Track" => 2,
+					_ => 0,
+				};
+				let actions = ACTIONS.lock().await.clone();
+				let mut outbound = OUTBOUND_EVENT_MANAGER.lock().await;
+				if let Some(manager) = outbound.as_mut() {
+					for (_, context) in actions
+						.iter()
+						.filter(|(uuid, _)| uuid == "me.amankhanna.oampris.repeat")
+					{
+						if let Err(e) = manager.set_state(context.clone(), state).await {
+							log::error!("Failed to set state: {}", e);
+						}
+					}
+				}
+			}
+
+			if let Some(shuffle_value) = changed_properties.get("Shuffle") {
+				let shuffle = *shuffle_value.downcast_ref::<bool>().unwrap_or(&false);
+				let actions = ACTIONS.lock().await.clone();
+				let mut outbound = OUTBOUND_EVENT_MANAGER.lock().await;
+				if let Some(manager) = outbound.as_mut() {
+					for (_, context) in actions
+						.iter()
+						.filter(|(uuid, _)| uuid == "me.amankhanna.oampris.shuffle")
+					{
+						if let Err(e) = manager.set_state(context.clone(), shuffle as u16).await {
+							log::error!("Failed to set state: {}", e);
 						}
 					}
 				}
