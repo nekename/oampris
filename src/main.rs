@@ -1,15 +1,26 @@
+use anyhow::Result;
 use base64::{engine::general_purpose, Engine as _};
 use futures_util::StreamExt;
 use openaction::*;
 use reqwest::Client;
 use std::collections::HashMap;
-use std::error::Error as StdError;
 use tokio::sync::Mutex;
 use zbus::fdo::DBusProxy;
 use zbus::{Connection, MatchRule, MessageStream, MessageType, Proxy};
 use zvariant::Value;
 
-async fn find_active_player(conn: &Connection) -> Result<String, Box<dyn StdError>> {
+async fn fetch_and_convert_to_data_url(url: &str) -> Result<String> {
+	let client = Client::new();
+	let response = client.get(url).send().await?;
+	let bytes = response.bytes().await?;
+	let mime_type = infer::get(&bytes)
+		.map(|info| info.mime_type())
+		.unwrap_or("application/octet-stream");
+	let base64_data = general_purpose::STANDARD.encode(&bytes);
+	Ok(format!("data:{};base64,{}", mime_type, base64_data))
+}
+
+async fn find_active_player(conn: &Connection) -> Result<String> {
 	let proxy = Proxy::new(
 		conn,
 		"org.freedesktop.DBus",
@@ -22,10 +33,10 @@ async fn find_active_player(conn: &Connection) -> Result<String, Box<dyn StdErro
 	names
 		.into_iter()
 		.find(|name| name.starts_with("org.mpris.MediaPlayer2."))
-		.ok_or_else(|| "No MPRIS players found".into())
+		.ok_or_else(|| anyhow::anyhow!("No MPRIS players found"))
 }
 
-async fn get_mpris_proxy() -> Result<Proxy<'static>, Box<dyn StdError>> {
+async fn get_mpris_proxy() -> Result<Proxy<'static>> {
 	let conn = Connection::session().await?;
 	let player_name = find_active_player(&conn).await?;
 
@@ -40,13 +51,13 @@ async fn get_mpris_proxy() -> Result<Proxy<'static>, Box<dyn StdError>> {
 	Ok(proxy)
 }
 
-async fn call_mpris_method(method: &str) -> Result<(), Box<dyn StdError>> {
+async fn call_mpris_method(method: &str) -> Result<()> {
 	let proxy = get_mpris_proxy().await?;
 	proxy.call_method(method, &()).await?;
 	Ok(())
 }
 
-async fn cycle_repeat_mode() -> Result<(), Box<dyn StdError>> {
+async fn cycle_repeat_mode() -> Result<()> {
 	let proxy = get_mpris_proxy().await?;
 	let current: String = proxy.get_property("LoopStatus").await?;
 	let next = match current.as_str() {
@@ -59,7 +70,7 @@ async fn cycle_repeat_mode() -> Result<(), Box<dyn StdError>> {
 	Ok(())
 }
 
-async fn toggle_shuffle() -> Result<(), Box<dyn StdError>> {
+async fn toggle_shuffle() -> Result<()> {
 	let proxy = get_mpris_proxy().await?;
 	let shuffle: bool = proxy.get_property("Shuffle").await?;
 	proxy.set_property("Shuffle", &(!shuffle)).await?;
@@ -76,9 +87,53 @@ impl openaction::ActionEventHandler for ActionEventHandler {
 	async fn will_appear(
 		&self,
 		event: AppearEvent,
-		_outbound: &mut OutboundEventManager,
+		outbound: &mut OutboundEventManager,
 	) -> EventHandlerResult {
-		ACTIONS.lock().await.push((event.action, event.context));
+		ACTIONS
+			.lock()
+			.await
+			.push((event.action.clone(), event.context.clone()));
+
+		match event.action.as_str() {
+			"me.amankhanna.oampris.playpause" => {
+				let proxy = get_mpris_proxy().await?;
+				let metadata_value: Value = proxy.get_property("Metadata").await?;
+				if let Some(art_url) = metadata_value
+					.downcast_ref::<zvariant::Dict>()
+					.and_then(|dict| dict.get::<str, str>("mpris:artUrl").ok().flatten())
+					.map(|url| url.to_string())
+				{
+					let image_data_url = if art_url.starts_with("data:") {
+						art_url
+					} else {
+						fetch_and_convert_to_data_url(&art_url).await?
+					};
+					outbound
+						.set_image(event.context, Some(image_data_url), None)
+						.await?;
+				}
+			}
+			"me.amankhanna.oampris.repeat" => {
+				let proxy = get_mpris_proxy().await?;
+				let loop_status_value: Value = proxy.get_property("LoopStatus").await?;
+				let loop_status = loop_status_value.downcast_ref::<str>().unwrap_or("None");
+				let state = match loop_status {
+					"None" => 0,
+					"Playlist" => 1,
+					"Track" => 2,
+					_ => 0,
+				};
+				outbound.set_state(event.context, state).await?;
+			}
+			"me.amankhanna.oampris.shuffle" => {
+				let proxy = get_mpris_proxy().await?;
+				let shuffle_value: Value = proxy.get_property("Shuffle").await?;
+				let shuffle = *shuffle_value.downcast_ref::<bool>().unwrap_or(&false);
+				outbound.set_state(event.context, shuffle as u16).await?;
+			}
+			_ => {}
+		}
+
 		Ok(())
 	}
 
@@ -110,17 +165,6 @@ impl openaction::ActionEventHandler for ActionEventHandler {
 
 		Ok(())
 	}
-}
-
-async fn fetch_and_convert_to_data_url(url: &str) -> Result<String, Box<dyn StdError>> {
-	let client = Client::new();
-	let response = client.get(url).send().await?;
-	let bytes = response.bytes().await?;
-	let mime_type = infer::get(&bytes)
-		.map(|info| info.mime_type())
-		.unwrap_or("application/octet-stream");
-	let base64_data = general_purpose::STANDARD.encode(&bytes);
-	Ok(format!("data:{};base64,{}", mime_type, base64_data))
 }
 
 async fn watch_album_art() {
