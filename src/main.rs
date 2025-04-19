@@ -179,7 +179,10 @@ async fn watch_album_art() {
 	loop {
 		let player_name = match find_active_player(&connection).await {
 			Ok(name) => name,
-			Err(_) => continue,
+			Err(_) => {
+				tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+				continue;
+			}
 		};
 
 		let signal_rule = match MatchRule::builder()
@@ -326,8 +329,6 @@ async fn watch_album_art() {
 				}
 			}
 		}
-
-		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 	}
 }
 
