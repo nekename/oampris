@@ -2,7 +2,7 @@
 	"Name": "Linux Media",
 	"Description": "Linux media controls using MPRIS",
 	"Author": "Aman Khanna (nekename)",
-	"Version": "1.0.0",
+	"Version": "1.1.0",
 	"CodePathLin": "oampris",
 	"Icon": "icons/playpause",
 	"Category": "Media",
