@@ -2,7 +2,6 @@ use anyhow::Result;
 use base64::{engine::general_purpose, Engine as _};
 use futures_util::StreamExt;
 use openaction::*;
-use reqwest::Client;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 use zbus::fdo::DBusProxy;
@@ -10,9 +9,16 @@ use zbus::{Connection, MatchRule, MessageStream, MessageType, Proxy};
 use zvariant::Value;
 
 async fn fetch_and_convert_to_data_url(url: &str) -> Result<String> {
-	let client = Client::new();
-	let response = client.get(url).send().await?;
-	let bytes = response.bytes().await?;
+	let bytes = if url.starts_with("data:") {
+		return Ok(url.to_owned());
+	} else if url.starts_with("file:") {
+		let path = url.trim_start_matches("file://");
+		std::fs::read(path)?
+	} else {
+		let response = reqwest::get(url).await?;
+		response.bytes().await?.to_vec()
+	};
+
 	let mime_type = infer::get(&bytes)
 		.map(|info| info.mime_type())
 		.unwrap_or("application/octet-stream");
@@ -103,11 +109,7 @@ impl openaction::ActionEventHandler for ActionEventHandler {
 					.and_then(|dict| dict.get::<str, str>("mpris:artUrl").ok().flatten())
 					.map(|url| url.to_string())
 				{
-					let image_data_url = if art_url.starts_with("data:") {
-						art_url
-					} else {
-						fetch_and_convert_to_data_url(&art_url).await?
-					};
+					let image_data_url = fetch_and_convert_to_data_url(&art_url).await?;
 					outbound
 						.set_image(event.context, Some(image_data_url), None)
 						.await?;
@@ -260,15 +262,11 @@ async fn watch_album_art() {
 					if Some(&art_url) != last_url.as_ref() {
 						last_url = Some(art_url.clone());
 
-						let image_data_url = if art_url.starts_with("data:") {
-							art_url.clone()
-						} else {
-							match fetch_and_convert_to_data_url(&art_url).await {
-								Ok(data_url) => data_url,
-								Err(e) => {
-									log::error!("Failed to fetch and convert image: {}", e);
-									continue;
-								}
+						let image_data_url = match fetch_and_convert_to_data_url(&art_url).await {
+							Ok(data_url) => data_url,
+							Err(e) => {
+								log::error!("Failed to fetch and convert image: {}", e);
+								continue;
 							}
 						};
 
