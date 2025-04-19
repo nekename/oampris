@@ -187,6 +187,14 @@ async fn watch_album_art() {
 			}
 		};
 
+		let dbus_proxy = match DBusProxy::new(&connection).await {
+			Ok(proxy) => proxy,
+			Err(e) => {
+				log::error!("Failed to create DBus proxy: {}", e);
+				return;
+			}
+		};
+
 		let signal_rule = match MatchRule::builder()
 			.msg_type(MessageType::Signal)
 			.interface("org.freedesktop.DBus.Properties")
@@ -202,17 +210,19 @@ async fn watch_album_art() {
 			}
 		};
 
-		let dbus_proxy = match DBusProxy::new(&connection).await {
-			Ok(proxy) => proxy,
-			Err(e) => {
-				log::error!("Failed to create DBus proxy: {}", e);
-				continue;
-			}
-		};
-
 		if let Err(e) = dbus_proxy.add_match_rule(signal_rule).await {
 			log::error!("Failed to add match rule: {}", e);
 			continue;
+		}
+
+		let name_owner_rule = MatchRule::builder()
+			.msg_type(MessageType::Signal)
+			.interface("org.freedesktop.DBus")
+			.and_then(|b| b.member("NameOwnerChanged"))
+			.map(|b| b.build());
+
+		if let Ok(rule) = name_owner_rule {
+			let _ = dbus_proxy.add_match_rule(rule).await;
 		}
 
 		let mut stream = MessageStream::from(&connection);
@@ -235,10 +245,17 @@ async fn watch_album_art() {
 				}
 			};
 
-			match header.interface().transpose() {
-				Some(Ok(i)) if i.as_str() == "org.freedesktop.DBus.Properties" => {}
-				_ => continue,
-			};
+			let member = header.member().ok().flatten().map(|m| m.to_string());
+			if member.as_deref() == Some("NameOwnerChanged") {
+				if let Ok((name, _old_owner, new_owner)) = msg.body::<(String, String, String)>() {
+					if name == player_name && new_owner.is_empty() {
+						break;
+					}
+				}
+				continue;
+			} else if member.as_deref() != Some("PropertiesChanged") {
+				continue;
+			}
 
 			let body: Result<(String, HashMap<String, Value>, Vec<String>), _> = msg.body();
 			let (interface, changed_properties, _) = match body {
