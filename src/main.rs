@@ -85,6 +85,92 @@ async fn toggle_shuffle() -> Result<()> {
 
 static ACTIONS: Mutex<Vec<(String, String)>> = Mutex::const_new(vec![]);
 
+async fn get_album_art(metadata: Option<&Value<'_>>) -> Option<String> {
+	fetch_and_convert_to_data_url(
+		&metadata?
+			.downcast_ref::<zvariant::Dict>()
+			.and_then(|dict| dict.get::<str, str>("mpris:artUrl").ok().flatten())
+			.map(|url| url.to_string())?,
+	)
+	.await
+	.ok()
+}
+
+async fn update_play_pause(
+	context: String,
+	outbound: &mut OutboundEventManager,
+	image: Option<String>,
+) -> Result<()> {
+	outbound.set_image(context.clone(), image, None).await?;
+	Ok(())
+}
+
+async fn update_repeat(
+	context: String,
+	outbound: &mut OutboundEventManager,
+	loop_status: Option<&Value<'_>>,
+) -> Result<()> {
+	let state = match loop_status {
+		Some(loop_status_value) => {
+			match loop_status_value.downcast_ref::<str>().unwrap_or("None") {
+				"None" => 0,
+				"Playlist" => 1,
+				"Track" => 2,
+				_ => 0,
+			}
+		}
+		_ => 0,
+	};
+	outbound.set_state(context, state).await?;
+	Ok(())
+}
+
+async fn update_shuffle(
+	context: String,
+	outbound: &mut OutboundEventManager,
+	shuffle: Option<&Value<'_>>,
+) -> Result<()> {
+	let state = shuffle
+		.and_then(|shuffle_value| shuffle_value.downcast_ref::<bool>().copied())
+		.unwrap_or(false);
+	outbound.set_state(context, state as u16).await?;
+	Ok(())
+}
+
+async fn update_all(outbound: &mut OutboundEventManager) {
+	let proxy_result = get_mpris_proxy().await;
+	let get_property = async |property: &str| match &proxy_result {
+		Ok(proxy) => proxy.get_property(property).await.ok(),
+		Err(_) => None,
+	};
+	let actions = ACTIONS.lock().await.clone();
+	for (uuid, context) in actions {
+		if let Err(error) = match uuid.as_str() {
+			"me.amankhanna.oampris.playpause" => {
+				update_play_pause(
+					context,
+					outbound,
+					get_album_art(get_property("Metadata").await.as_ref()).await,
+				)
+				.await
+			}
+			"me.amankhanna.oampris.repeat" => {
+				update_repeat(context, outbound, get_property("LoopStatus").await.as_ref()).await
+			}
+			"me.amankhanna.oampris.shuffle" => {
+				update_shuffle(context, outbound, get_property("Shuffle").await.as_ref()).await
+			}
+			_ => Ok(()),
+		} {
+			log::error!(
+				"Failed to update {}: {}",
+				uuid.trim_start_matches("me.amankhanna.oampris."),
+				error
+			);
+		}
+	}
+}
+
 struct GlobalEventHandler {}
 impl openaction::GlobalEventHandler for GlobalEventHandler {}
 
@@ -95,47 +181,8 @@ impl openaction::ActionEventHandler for ActionEventHandler {
 		event: AppearEvent,
 		outbound: &mut OutboundEventManager,
 	) -> EventHandlerResult {
-		ACTIONS
-			.lock()
-			.await
-			.push((event.action.clone(), event.context.clone()));
-
-		match event.action.as_str() {
-			"me.amankhanna.oampris.playpause" => {
-				let proxy = get_mpris_proxy().await?;
-				let metadata_value: Value = proxy.get_property("Metadata").await?;
-				if let Some(art_url) = metadata_value
-					.downcast_ref::<zvariant::Dict>()
-					.and_then(|dict| dict.get::<str, str>("mpris:artUrl").ok().flatten())
-					.map(|url| url.to_string())
-				{
-					let image_data_url = fetch_and_convert_to_data_url(&art_url).await?;
-					outbound
-						.set_image(event.context, Some(image_data_url), None)
-						.await?;
-				}
-			}
-			"me.amankhanna.oampris.repeat" => {
-				let proxy = get_mpris_proxy().await?;
-				let loop_status_value: Value = proxy.get_property("LoopStatus").await?;
-				let loop_status = loop_status_value.downcast_ref::<str>().unwrap_or("None");
-				let state = match loop_status {
-					"None" => 0,
-					"Playlist" => 1,
-					"Track" => 2,
-					_ => 0,
-				};
-				outbound.set_state(event.context, state).await?;
-			}
-			"me.amankhanna.oampris.shuffle" => {
-				let proxy = get_mpris_proxy().await?;
-				let shuffle_value: Value = proxy.get_property("Shuffle").await?;
-				let shuffle = *shuffle_value.downcast_ref::<bool>().unwrap_or(&false);
-				outbound.set_state(event.context, shuffle as u16).await?;
-			}
-			_ => {}
-		}
-
+		ACTIONS.lock().await.push((event.action, event.context));
+		update_all(outbound).await;
 		Ok(())
 	}
 
@@ -153,7 +200,7 @@ impl openaction::ActionEventHandler for ActionEventHandler {
 		event: KeyEvent,
 		_outbound: &mut OutboundEventManager,
 	) -> EventHandlerResult {
-		if let Err(e) = match event.action.as_str() {
+		if let Err(error) = match event.action.as_str() {
 			"me.amankhanna.oampris.playpause" => call_mpris_method("PlayPause").await,
 			"me.amankhanna.oampris.stop" => call_mpris_method("Stop").await,
 			"me.amankhanna.oampris.previous" => call_mpris_method("Previous").await,
@@ -162,7 +209,11 @@ impl openaction::ActionEventHandler for ActionEventHandler {
 			"me.amankhanna.oampris.shuffle" => toggle_shuffle().await,
 			_ => return Ok(()),
 		} {
-			log::error!("MPRIS call failed ({}): {}", event.action, e);
+			log::error!(
+				"Failed to make MPRIS call for {}: {}",
+				event.action.trim_start_matches("me.amankhanna.oampris."),
+				error
+			);
 		}
 
 		Ok(())
@@ -172,13 +223,19 @@ impl openaction::ActionEventHandler for ActionEventHandler {
 async fn watch_album_art() {
 	let connection = match Connection::session().await {
 		Ok(conn) => conn,
-		Err(e) => {
-			log::error!("Failed to connect to D-Bus session: {}", e);
+		Err(error) => {
+			log::error!("Failed to connect to DBus session: {}", error);
 			return;
 		}
 	};
 
 	loop {
+		let mut outbound = OUTBOUND_EVENT_MANAGER.lock().await;
+		if let Some(manager) = outbound.as_mut() {
+			let _ = update_all(manager).await;
+		}
+		drop(outbound);
+
 		let player_name = match find_active_player(&connection).await {
 			Ok(name) => name,
 			Err(_) => {
@@ -189,8 +246,8 @@ async fn watch_album_art() {
 
 		let dbus_proxy = match DBusProxy::new(&connection).await {
 			Ok(proxy) => proxy,
-			Err(e) => {
-				log::error!("Failed to create DBus proxy: {}", e);
+			Err(error) => {
+				log::error!("Failed to create DBus proxy: {}", error);
 				return;
 			}
 		};
@@ -204,14 +261,14 @@ async fn watch_album_art() {
 			.map(|b| b.build())
 		{
 			Ok(rule) => rule,
-			Err(e) => {
-				log::error!("Failed to build match rule: {}", e);
+			Err(error) => {
+				log::error!("Failed to build match rule: {}", error);
 				continue;
 			}
 		};
 
-		if let Err(e) = dbus_proxy.add_match_rule(signal_rule).await {
-			log::error!("Failed to add match rule: {}", e);
+		if let Err(error) = dbus_proxy.add_match_rule(signal_rule).await {
+			log::error!("Failed to add match rule: {}", error);
 			continue;
 		}
 
@@ -226,21 +283,20 @@ async fn watch_album_art() {
 		}
 
 		let mut stream = MessageStream::from(&connection);
-		let mut last_url: Option<String> = None;
 
 		while let Some(msg_result) = stream.next().await {
 			let msg = match msg_result {
 				Ok(m) => m,
-				Err(e) => {
-					log::error!("Error receiving message: {}", e);
+				Err(error) => {
+					log::error!("Error receiving message: {}", error);
 					continue;
 				}
 			};
 
 			let header = match msg.header() {
 				Ok(h) => h,
-				Err(e) => {
-					log::error!("Failed to get message header: {}", e);
+				Err(error) => {
+					log::error!("Failed to get message header: {}", error);
 					continue;
 				}
 			};
@@ -260,8 +316,8 @@ async fn watch_album_art() {
 			let body: Result<(String, HashMap<String, Value>, Vec<String>), _> = msg.body();
 			let (interface, changed_properties, _) = match body {
 				Ok(b) => b,
-				Err(e) => {
-					log::error!("Error reading message body: {}", e);
+				Err(error) => {
+					log::error!("Error reading message body: {}", error);
 					continue;
 				}
 			};
@@ -270,77 +326,52 @@ async fn watch_album_art() {
 				continue;
 			}
 
-			if let Some(metadata_value) = changed_properties.get("Metadata") {
-				if let Some(art_url) = metadata_value
-					.downcast_ref::<zvariant::Dict>()
-					.and_then(|dict| dict.get::<str, str>("mpris:artUrl").ok().flatten())
-					.map(|url| url.to_string())
-				{
-					if Some(&art_url) != last_url.as_ref() {
-						last_url = Some(art_url.clone());
+			let actions = ACTIONS.lock().await.clone();
+			let mut outbound = OUTBOUND_EVENT_MANAGER.lock().await;
+			let Some(outbound) = outbound.as_mut() else {
+				continue;
+			};
 
-						let image_data_url = match fetch_and_convert_to_data_url(&art_url).await {
-							Ok(data_url) => data_url,
-							Err(e) => {
-								log::error!("Failed to fetch and convert image: {}", e);
-								continue;
-							}
-						};
-
-						let actions = ACTIONS.lock().await.clone();
-						let mut outbound = OUTBOUND_EVENT_MANAGER.lock().await;
-						if let Some(manager) = outbound.as_mut() {
-							for (_, context) in actions
-								.iter()
-								.filter(|(uuid, _)| uuid == "me.amankhanna.oampris.playpause")
-							{
-								if let Err(e) = manager
-									.set_image(context.clone(), Some(image_data_url.clone()), None)
-									.await
-								{
-									log::error!("Failed to set image: {}", e);
-								}
-							}
-						}
-					}
+			if let Some(playback_status_value) = changed_properties.get("PlaybackStatus") {
+				if playback_status_value.downcast_ref::<str>() == Some("Stopped") {
+					update_all(outbound).await;
+					continue;
 				}
 			}
 
-			if let Some(loop_status_value) = changed_properties.get("LoopStatus") {
-				let loop_status = loop_status_value.downcast_ref::<str>().unwrap_or("None");
-				let state = match loop_status {
-					"None" => 0,
-					"Playlist" => 1,
-					"Track" => 2,
-					_ => 0,
-				};
-				let actions = ACTIONS.lock().await.clone();
-				let mut outbound = OUTBOUND_EVENT_MANAGER.lock().await;
-				if let Some(manager) = outbound.as_mut() {
-					for (_, context) in actions
-						.iter()
-						.filter(|(uuid, _)| uuid == "me.amankhanna.oampris.repeat")
-					{
-						if let Err(e) = manager.set_state(context.clone(), state).await {
-							log::error!("Failed to set state: {}", e);
-						}
-					}
-				}
-			}
+			let album_art_url = get_album_art(changed_properties.get("Metadata")).await;
 
-			if let Some(shuffle_value) = changed_properties.get("Shuffle") {
-				let shuffle = *shuffle_value.downcast_ref::<bool>().unwrap_or(&false);
-				let actions = ACTIONS.lock().await.clone();
-				let mut outbound = OUTBOUND_EVENT_MANAGER.lock().await;
-				if let Some(manager) = outbound.as_mut() {
-					for (_, context) in actions
-						.iter()
-						.filter(|(uuid, _)| uuid == "me.amankhanna.oampris.shuffle")
+			for (uuid, context) in actions {
+				if let Err(error) = match uuid.as_str() {
+					"me.amankhanna.oampris.playpause"
+						if changed_properties.contains_key("Metadata") =>
 					{
-						if let Err(e) = manager.set_state(context.clone(), shuffle as u16).await {
-							log::error!("Failed to set state: {}", e);
-						}
+						update_play_pause(context.clone(), outbound, album_art_url.clone()).await
 					}
+					"me.amankhanna.oampris.repeat"
+						if changed_properties.contains_key("LoopStatus") =>
+					{
+						update_repeat(
+							context.clone(),
+							outbound,
+							changed_properties.get("LoopStatus"),
+						)
+						.await
+					}
+					"me.amankhanna.oampris.shuffle"
+						if changed_properties.contains_key("Shuffle") =>
+					{
+						update_shuffle(context.clone(), outbound, changed_properties.get("Shuffle"))
+							.await
+					}
+					_ => continue,
+				} {
+					log::error!(
+						"Failed to update {} at {}: {}",
+						uuid.trim_start_matches("me.amankhanna.oampris."),
+						context,
+						error
+					);
 				}
 			}
 		}
@@ -349,13 +380,13 @@ async fn watch_album_art() {
 
 #[tokio::main]
 async fn main() {
-	if let Err(e) = simplelog::TermLogger::init(
+	if let Err(error) = simplelog::TermLogger::init(
 		simplelog::LevelFilter::Debug,
 		simplelog::Config::default(),
 		simplelog::TerminalMode::Stdout,
 		simplelog::ColorChoice::Never,
 	) {
-		eprintln!("Logger initialization failed: {}", e);
+		eprintln!("Logger initialization failed: {}", error);
 	}
 
 	tokio::spawn(watch_album_art());
